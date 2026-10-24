@@ -331,3 +331,23 @@ body.typing main { padding-bottom: 24px; }
   .cc-name { font-size: 20px; }
   .who .big { font-size: 26px; }
 }
+
+/* ── add a person (v1.4) ─────────────────────────────── */
+.h2row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin: 26px 0 8px; }
+.h2row h2 { margin: 0; }
+.h2row .linkbtn { display: inline-flex; align-items: center; gap: 4px; text-decoration: none; }
+.h2row .linkbtn svg, .btn svg { width: 18px; height: 18px; }
+.hint.err { font-weight: 700; }
+
+/* ── find / person (v1.5) ─────────────────────────────── */
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+input[type="search"].input { -webkit-appearance: none; appearance: none; }
+.person.static { cursor: default; }
+.person.static:active { background: var(--surface); }
+.person .acts { grid-column: 1 / -1; }
+.checkrow { display: flex; gap: 10px; align-items: center; font-weight: 700; margin: 12px 0 2px; }
+.checkrow input { width: 20px; height: 20px; accent-color: var(--indigo); }
+.bottombar .row .btn.call { min-height: 50px; font-size: 17px; border-radius: var(--radius); }
+.chip.bad { background: var(--rose-soft); color: var(--rose); }
+.chip.done { background: var(--indigo-soft); color: var(--indigo); }
+@media (prefers-color-scheme: dark) { .chip.done { color: #c6ceff; } }

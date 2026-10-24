@@ -1,5 +1,5 @@
 /* Calling Seva service worker: app shell offline, never touches the API or Google sign-in */
-const VERSION = '1.2.0';
+const VERSION = '1.5.0';
 const SHELL = 'seva-shell-' + VERSION;
 const FONTS = 'seva-fonts';
 const FILES = ['./', './index.html', './styles.css', './app.js', './manifest.webmanifest',

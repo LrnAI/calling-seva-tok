@@ -5,7 +5,7 @@
  */
 'use strict';
 
-const VERSION = '1.2.0';
+const VERSION = '1.5.0';
 const RECENT_DEFAULT_H = 24;
 const PENDING_MAX_MS = 3 * 3600e3;
 
@@ -23,7 +23,9 @@ const S = {
   data: store.get('data', null),        // last bootstrap state
   outbox: store.get('outbox', []),      // unsent call logs
   failed: store.get('failed', []),      // logs the server refused
-  pending: store.get('pending', null),  // call in progress {campaign_id, contact_id, t}
+  pending: store.get('pending', null),  // call in progress {campaign_id, contact_id, t, person?}
+  people: store.get('people', {}),      // person pages seen recently (works offline)
+  recent: store.get('recent', null),    // my recent people
   device: store.get('device', null),
   view: null,
   syncing: false,
@@ -55,6 +57,9 @@ const ICON = {
   gear: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>',
   refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/></svg>',
   wa: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2a10 10 0 0 0-8.6 15.1L2 22l5-1.3A10 10 0 1 0 12 2zm0 18.2c-1.6 0-3.1-.4-4.4-1.2l-.3-.2-3 .8.8-2.9-.2-.3A8.2 8.2 0 1 1 12 20.2zm4.5-6.1c-.2-.1-1.5-.7-1.7-.8-.2-.1-.4-.1-.6.1l-.8 1c-.1.2-.3.2-.5.1a6.7 6.7 0 0 1-3.3-2.9c-.3-.4.3-.4.7-1.3.1-.2 0-.3 0-.5l-.8-1.8c-.2-.5-.4-.4-.6-.4h-.5a1 1 0 0 0-.7.3 3 3 0 0 0-.9 2.2c0 1.3.9 2.5 1 2.7.1.2 1.8 2.8 4.4 3.9 1.6.7 2.3.8 3.1.6.5-.1 1.5-.6 1.7-1.2.2-.6.2-1.1.2-1.2-.1-.1-.3-.2-.5-.3z"/></svg>',
+  search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>',
+  edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20h4L19 9l-4-4L4 16v4z"/><path d="M13.5 6.5l4 4"/></svg>',
+  plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
   mark: '<svg viewBox="0 0 56 56" aria-hidden="true"><circle cx="28" cy="28" r="27" fill="#e8a317"/><path fill="#2b3670" d="M20.3 24.3a19 19 0 0 0 8.4 8.4l2.8-2.8c.4-.4.9-.5 1.3-.3 1.4.5 2.9.7 4.5.7.7 0 1.3.6 1.3 1.3v4.4c0 .7-.6 1.3-1.3 1.3A21.4 21.4 0 0 1 15.9 16c0-.7.6-1.3 1.3-1.3h4.4c.7 0 1.3.6 1.3 1.3 0 1.6.2 3.1.7 4.5.1.4 0 .9-.3 1.3z"/></svg>'
 };
 
@@ -210,23 +215,61 @@ async function syncOutbox() {
   if (!evs.length) return;
   S.syncing = true;
   paintTopbarState();
+  const strip = ev => { const o = Object.assign({}, ev); delete o.by; delete o.kind; delete o.contact_name; delete o.campaign_name; return o; };
   try {
-    const batch = evs.slice(0, 25).map(ev => {
-      const o = Object.assign({}, ev);
-      delete o.by; delete o.contact_name; delete o.campaign_name;
-      return o;
-    });
-    const r = await api('log', { events: batch });
-    const done = new Set([].concat(r.accepted || [], r.dup || []));
-    (r.rejected || []).forEach(x => {
-      const ev = S.outbox.find(e => e.id === x.id);
-      if (ev) S.failed.push(Object.assign({}, ev, { reason: x.reason }));
-      done.add(x.id);
-    });
+    const done = new Set();
+    let failedCalls = 0, failedAdds = 0;
+    const calls = evs.filter(ev => !ev.kind).slice(0, 25);
+    const adds = evs.filter(ev => ev.kind === 'add').slice(0, 25);
+    const edits = evs.filter(ev => ev.kind === 'edit').slice(0, 25);
+    if (calls.length) {
+      const r = await api('log', { events: calls.map(strip) });
+      [].concat(r.accepted || [], r.dup || []).forEach(id => done.add(id));
+      (r.rejected || []).forEach(x => {
+        const ev = S.outbox.find(e => e.id === x.id);
+        if (ev) S.failed.push(Object.assign({}, ev, { reason: x.reason }));
+        done.add(x.id);
+        failedCalls++;
+      });
+      setState(r.state);
+    }
+    if (adds.length) {
+      const r = await api('addContacts', { events: adds.map(strip) });
+      (r.dup || []).forEach(id => done.add(id));
+      (r.results || []).forEach(x => {
+        done.add(x.id);
+        const ev = S.outbox.find(e => e.id === x.id);
+        if (!x.ok) {
+          if (ev) S.failed.push(Object.assign({}, ev, { status: 'New person', reason: x.reason }));
+          failedAdds++;
+        } else if (x.existed) {
+          toast(`${x.name} was already in the list, so their details were added to the existing entry`, 4000);
+        } else if (x.blocked) {
+          toast(`${x.name} is marked "do not call", so they were not added to a campaign`, 4000);
+        }
+      });
+      setState(r.state);
+    }
+    if (edits.length) {
+      const r = await api('updateContacts', { events: edits.map(strip) });
+      (r.dup || []).forEach(id => done.add(id));
+      (r.results || []).forEach(x => {
+        done.add(x.id);
+        if (!x.ok) {
+          const ev = S.outbox.find(e => e.id === x.id);
+          if (ev) S.failed.push(Object.assign({}, ev, { status: 'Edit', reason: x.reason }));
+          failedCalls++;
+        }
+      });
+      setState(r.state);
+    }
+    const touched = new Set(evs.filter(ev => done.has(ev.id)).map(ev => ev.contact_id).filter(Boolean));
     S.outbox = S.outbox.filter(ev => !done.has(ev.id));
     save('outbox', 'failed');
-    setState(r.state);
-    if ((r.rejected || []).length) toast((r.rejected.length === 1 ? '1 call' : r.rejected.length + ' calls') + " couldn't be saved. See Settings.", 4000);
+    // the person page on screen shows the saved version
+    if (S.view && S.view.view === 'person' && touched.has(S.view.params.contact_id)) loadPerson(S.view.params.contact_id, true);
+    if (failedCalls) toast((failedCalls === 1 ? '1 call' : failedCalls + ' calls') + " couldn't be saved. See Settings.", 4000);
+    if (failedAdds) toast((failedAdds === 1 ? '1 new person' : failedAdds + ' new people') + " couldn't be saved. See Settings.", 4000);
     rerender();
     if (myOutbox().length) setTimeout(syncOutbox, 500);
   } catch (e) {
@@ -267,7 +310,7 @@ function recentCall(c) {
   const hours = (S.data && S.data.recent_call_hours) || RECENT_DEFAULT_H;
   const cutoff = Date.now() - hours * 3600e3;
   const camp = campaign(c.campaign_id);
-  const h = (c.history || []).find(x => x.at > cutoff);
+  const h = (c.history || []).find(x => x.at > cutoff && (!x.kind || x.kind === 'call'));
   if (h) return { at: h.at, by: h.by, campaign: h.campaign, same: camp && h.campaign === camp.name };
   if (c.contact.last_contacted_at > cutoff) return { at: c.contact.last_contacted_at, by: c.contact.last_contacted_by, campaign: '' };
   return null;
@@ -321,7 +364,7 @@ function startView() {
 function rerender() {
   // re-render the current view unless the person is typing in a form
   if (!S.view) return;
-  if (S.view.view === 'log' || S.view.view === 'setup' || S.view.view === 'signin') return;
+  if (['log', 'add', 'edit', 'find', 'setup', 'signin'].includes(S.view.view)) return;
   render();
 }
 function render() {
@@ -330,7 +373,7 @@ function render() {
   // guard routes
   if (v !== 'setup' && !S.cfg) { S.view = { view: 'setup', params: {} }; return render(); }
   if (!['setup', 'signin'].includes(v) && !S.session) { S.view = { view: 'signin', params: {} }; return render(); }
-  const views = { setup: viewSetup, signin: viewSignin, home: viewHome, campaign: viewCampaign, contact: viewContact, log: viewLog, settings: viewSettings };
+  const views = { setup: viewSetup, signin: viewSignin, home: viewHome, campaign: viewCampaign, contact: viewContact, log: viewLog, add: viewAdd, find: viewFind, person: viewPerson, edit: viewEdit, settings: viewSettings };
   (views[v] || viewHome)(S.view.params || {});
   paintTopbarState();
 }
@@ -607,11 +650,19 @@ function viewHome() {
   app().innerHTML = `<div class="screen">
       ${topbar((S.cfg && S.cfg.n) || 'Calling Seva')}
       <main>
-        <p class="hello">${name ? 'Hi ' + esc(name) + '.' : ''} ${queued ? `${queued} call${queued > 1 ? 's' : ''} saved on this phone, sending when online.` : ''}</p>
+        <p class="hello">${name ? 'Hi ' + esc(name) + '.' : ''} ${queued ? `${queued} saved on this phone, sending when online.` : ''}</p>
         ${installTip()}
         ${body}
-      </main></div>`;
+      </main>
+      <div class="bottombar"><div class="inner">
+        <div class="row">
+          <button class="btn" id="findperson">${ICON.search} Find a person</button>
+          <button class="btn" id="addperson">${ICON.plus} Add a person</button>
+        </div>
+      </div></div></div>`;
   bindTopbar(app());
+  $('#addperson').addEventListener('click', () => nav('add', {}));
+  $('#findperson').addEventListener('click', () => nav('find', {}));
   bindInstallTip();
   app().querySelectorAll('[data-camp]').forEach(b => b.addEventListener('click', () => nav('campaign', { id: b.dataset.camp })));
   if (d && Date.now() - S.lastRefresh > 30000) refresh(true);
@@ -641,7 +692,7 @@ function viewCampaign(p) {
       <main>
         <div class="stats"><span><b>${k.due || 0}</b> to call</span><span><b>${k.later || 0}</b> later</span><span><b>${k.done || 0}</b> done</span>${c.end_date ? `<span>Ends ${esc(new Date(c.end_date).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }))}</span>` : ''}</div>
         ${c.script ? `<details class="note"><summary>What to say</summary><div class="body">${esc(c.script)}</div></details>` : ''}
-        <h2>Your list</h2>
+        <div class="h2row"><h2>Your list</h2><button class="linkbtn" id="addhere">${ICON.plus} Add a person</button></div>
         ${people}
       </main>
       <div class="bottombar"><div class="inner">
@@ -651,6 +702,7 @@ function viewCampaign(p) {
     </div>`;
   bindTopbar(app());
   app().querySelectorAll('[data-contact]').forEach(b => b.addEventListener('click', () => nav('contact', { campaign_id: c.id, contact_id: b.dataset.contact })));
+  $('#addhere').addEventListener('click', () => nav('add', { campaign_id: c.id }));
   $('#get').addEventListener('click', async e => {
     const btn = e.currentTarget;
     busy(btn, true);
@@ -702,6 +754,7 @@ function viewContact(p) {
         <h2>Earlier calls</h2>
         ${(x.history || []).length ? timelineHtml(x.history, c.name) : '<p class="muted">No calls yet. You\'re the first.</p>'}
         <p style="margin-top:20px"><button class="linkbtn" id="logonly">Called another way? Log it here</button><br>
+        <button class="linkbtn" id="openperson">Full page: all campaigns, edit details</button><br>
         <button class="linkbtn" id="giveone">Not now — give this contact back</button></p>
       </main>
       <div class="bottombar"><div class="inner">
@@ -721,6 +774,7 @@ function viewContact(p) {
   });
   $('#wa').addEventListener('click', () => mark('whatsapp'));
   $('#logonly').addEventListener('click', () => nav('log', { campaign_id: c.id, contact_id: x.contact.contact_id }));
+  $('#openperson').addEventListener('click', () => nav('person', { contact_id: x.contact.contact_id }));
   $('#giveone').addEventListener('click', async e => {
     const btn = e.currentTarget;
     busy(btn, true);
@@ -740,6 +794,11 @@ function checkReturnFromCall() {
   if (Date.now() - pnd.t > PENDING_MAX_MS) { S.pending = null; save('pending'); return; }
   if (Date.now() - pnd.t < 1500) return; // dialer hasn't opened yet
   if (S.view && S.view.view === 'log') return;
+  if (pnd.person) {
+    if (!S.people[pnd.contact_id]) { S.pending = null; save('pending'); return; }
+    nav('log', { person: true, contact_id: pnd.contact_id, campaign_id: pnd.campaign_id || '', returned: true });
+    return;
+  }
   if (!findClaim(pnd.campaign_id, pnd.contact_id)) { S.pending = null; save('pending'); return; }
   nav('log', { campaign_id: pnd.campaign_id, contact_id: pnd.contact_id, returned: true });
 }
@@ -799,12 +858,32 @@ function toLocalInput(ms) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+function personCampaignChoice(per, wanted) {
+  const usable = (per.campaigns || []).filter(m => m.usable && campaign(m.campaign_id));
+  if (wanted && campaign(wanted)) return wanted;
+  if (usable.length) return usable[0].campaign_id;
+  return ((S.data && S.data.campaigns) || [])[0] ? S.data.campaigns[0].id : '';
+}
+
 function viewLog(p) {
-  const x = findClaim(p.campaign_id, p.contact_id);
+  const personMode = !!p.person;
+  let x, per = null, membership = null;
+  if (personMode) {
+    per = S.people[p.contact_id];
+    if (!per) { nav('person', { contact_id: p.contact_id }, true); return; }
+    const cid = personCampaignChoice(per, p.campaign_id);
+    if (!cid) { toast('No campaign is open for you to log this call'); history.back(); return; }
+    if (cid !== p.campaign_id) { p = Object.assign({}, p, { campaign_id: cid }); try { history.replaceState({ view: 'log', params: p }, ''); } catch (e) { } S.view.params = p; }
+    membership = (per.campaigns || []).find(m => m.campaign_id === cid) || null;
+    x = { campaign_id: cid, contact: per.contact, history: per.history || [], status: membership ? membership.status : '', state: membership ? membership.state : '', others: [] };
+  } else {
+    x = findClaim(p.campaign_id, p.contact_id);
+  }
   const c = campaign(p.campaign_id);
   if (!x || !c) { S.pending = null; save('pending'); nav('home', {}, true); return; }
+  const correction = personMode && !!p.correction;
   const nm = firstName(x.contact.name);
-  const pnd = S.pending && S.pending.contact_id === p.contact_id && S.pending.campaign_id === p.campaign_id ? S.pending : null;
+  const pnd = S.pending && S.pending.contact_id === p.contact_id && (personMode ? S.pending.person : S.pending.campaign_id === p.campaign_id) ? S.pending : null;
   const notesF = noteFields().filter(f => f.editable);
   const notesRO = noteFields().filter(f => !f.editable && f.show_on_card);
   const editable = (S.data.fields || []).filter(f => f.editable && f.key !== 'phone' && f.type !== 'note');
@@ -813,13 +892,21 @@ function viewLog(p) {
   const choices = callbackChoices();
   const hist = x.history || [];
   const facts = cardFacts(x, 4);
-  const next = nextClaim(c.id, x.contact.contact_id);
-  const moreDue = ((c.counts || {}).due || 0) > 0;
+  const next = personMode ? null : nextClaim(c.id, x.contact.contact_id);
+  const moreDue = !personMode && ((c.counts || {}).due || 0) > 0;
   const canNext = !!next || moreDue;
+  const usableAll = personMode ? ((S.data && S.data.campaigns) || []) : [];
+  const campPicker = personMode ? `<div class="field"><label for="campsel">${correction ? 'Fix the result for' : 'Log this for'}</label>
+      <select class="input" id="campsel">${usableAll.map(k => {
+        const m = (per.campaigns || []).find(mm => mm.campaign_id === k.id);
+        if (correction && !m) return '';
+        return `<option value="${esc(k.id)}" ${k.id === c.id ? 'selected' : ''}>${esc(k.name)}${m ? (m.status ? ' (now: ' + esc(m.status) + ')' : ' (not called yet)') : ' (will add them)'}</option>`;
+      }).join('')}</select></div>` : '';
+  const incomingBox = personMode && !correction ? `<label class="checkrow"><input type="checkbox" id="incoming" ${pnd ? '' : 'checked'}> They called me</label>` : '';
   const nextLabel = next ? 'Save, next: ' + esc(firstName(next.contact.name) || fmtPhone(next.contact.phone)) : 'Save, get next';
 
   app().innerHTML = `<div class="screen tall">
-      ${topbar(x.contact.name || 'Call', c.name, { back: true, noTools: true })}
+      ${topbar(x.contact.name || 'Call', correction ? 'Fix the last result' : (personMode ? 'Log a call' : c.name), { back: true, noTools: true })}
       <main class="callmain">
         <section class="callcard">
           <div class="cc-row">
@@ -839,7 +926,9 @@ function viewLog(p) {
           : '<p class="muted small">First call to this person.</p>'}
         ${c.script ? `<details class="note"><summary>What to say</summary><div class="body">${esc(c.script)}</div></details>` : ''}
 
-        <p class="ask" id="ask">How did it go?</p>
+        ${campPicker ? `<div style="margin-top:22px">${campPicker}</div>` : ''}
+        <p class="ask" id="ask">${correction ? 'What should the result be?' : 'How did it go?'}</p>
+        ${incomingBox}
         <div class="tiles" role="group" aria-label="Call result">
           ${c.statuses.map((st, i) => `<button class="tile o-${esc(st.outcome)}" data-status="${i}" aria-pressed="${draft.status === st.label}">${esc(st.label)}</button>`).join('')}
         </div>
@@ -849,8 +938,8 @@ function viewLog(p) {
           <input class="input" type="datetime-local" id="cbat">
         </div>
         <div class="field">
-          <label for="notes">Notes from this call</label>
-          <textarea class="input" id="notes" rows="3" placeholder="What did they say? Whoever calls next will see this.">${esc(draft.notes || '')}</textarea>
+          <label for="notes">${correction ? 'Why are you changing it? (optional)' : 'Notes from this call'}</label>
+          <textarea class="input" id="notes" rows="3" placeholder="${correction ? 'e.g. tapped the wrong button' : 'What did they say? Whoever calls next will see this.'}">${esc(draft.notes || '')}</textarea>
         </div>
         ${editable.length ? `<details class="note" style="margin-top:18px" id="details">
           <summary>Update ${esc(nm)}'s details${blanks ? ` (${blanks} blank)` : ''}</summary>
@@ -862,13 +951,15 @@ function viewLog(p) {
       <div class="bottombar"><div class="inner">
         <div class="pickfirst" id="pickfirst">Pick a result above to save</div>
         <div class="row" id="saverow" hidden>
-          ${canNext ? `<button class="btn" id="saveonly">Save</button><button class="btn primary" id="savenext">${nextLabel}</button>` : '<button class="btn primary" id="saveonly">Save call</button>'}
+          ${canNext ? `<button class="btn" id="saveonly">Save</button><button class="btn primary" id="savenext">${nextLabel}</button>` : `<button class="btn primary" id="saveonly">${correction ? 'Save correction' : 'Save call'}</button>`}
         </div>
       </div></div>
     </div>`;
   $('[data-act="back"]').addEventListener('click', () => { S.pending = null; save('pending'); history.back(); });
-  $('#redial').addEventListener('click', () => { S.pending = { campaign_id: c.id, contact_id: x.contact.contact_id, t: pnd ? pnd.t : Date.now(), channel: 'phone' }; save('pending'); });
-  $('#wa2').addEventListener('click', () => { if (!pnd) { S.pending = { campaign_id: c.id, contact_id: x.contact.contact_id, t: Date.now(), channel: 'whatsapp' }; save('pending'); } });
+  $('#redial').addEventListener('click', () => { S.pending = { campaign_id: c.id, contact_id: x.contact.contact_id, t: pnd ? pnd.t : Date.now(), channel: 'phone', person: personMode }; save('pending'); const ib = $('#incoming'); if (ib) ib.checked = false; });
+  $('#wa2').addEventListener('click', () => { if (!pnd) { S.pending = { campaign_id: c.id, contact_id: x.contact.contact_id, t: Date.now(), channel: 'whatsapp', person: personMode }; save('pending'); } });
+  const cs = $('#campsel');
+  if (cs) cs.addEventListener('change', () => { persistDraft(); nav('log', Object.assign({}, p, { campaign_id: cs.value }), true); });
 
   let picked = null;
   let cbAt = null;
@@ -932,12 +1023,33 @@ function viewLog(p) {
       notes: $('#notes').value.trim(),
       changes,
       called_at: pnd ? pnd.t : Date.now(),
-      away_sec: pnd ? Math.round((Date.now() - pnd.t) / 1000) : null
+      away_sec: pnd ? Math.round((Date.now() - pnd.t) / 1000) : null,
+      incoming: !!($('#incoming') && $('#incoming').checked),
+      correction: correction || undefined,
+      prev_status: correction && membership ? membership.status : undefined
     });
     S.pending = null;
     save('outbox', 'pending');
     store.del('draft:' + p.campaign_id + ':' + p.contact_id);
     const savedMsg = navigator.onLine ? 'Saved' : 'Saved on this phone. It will send when you are online.';
+    if (personMode) {
+      // show the change on the person page straight away; the server copy replaces it after sending
+      if (per) {
+        let m = (per.campaigns || []).find(mm => mm.campaign_id === c.id);
+        if (!m) { m = { campaign_id: c.id, name: c.name, usable: true }; per.campaigns = (per.campaigns || []).concat([m]); }
+        m.status = picked.label;
+        (per.history = per.history || []).unshift({ at: Date.now(), by: S.user.name, campaign: c.name, status: correction ? picked.label + ' (corrected)' : picked.label, notes: $('#notes').value.trim(), kind: correction ? 'correction' : 'call', pending: true });
+        Object.keys(changes).forEach(k => { per.contact.values[k] = changes[k]; if (k === 'name') { per.contact.name = changes[k]; per.name = changes[k]; } });
+        rememberPerson(per);
+      }
+      toast(savedMsg);
+      // go back to the person page this screen was opened from, rather than stacking another copy
+      const prev = history.state;
+      try { history.back(); } catch (e) { nav('person', { contact_id: p.contact_id }, true); }
+      setTimeout(() => { if (S.view && S.view.view === 'log' && history.state === prev) nav('person', { contact_id: p.contact_id }, true); }, 400);
+      syncOutbox();
+      return;
+    }
     if (!goNext) { toast(savedMsg); nav('campaign', { id: c.id }, true); syncOutbox(); return; }
 
     if (next) {
@@ -970,6 +1082,303 @@ function viewLog(p) {
   if (sn) sn.addEventListener('click', () => doSave(true));
 }
 
+/* ───────── views: add a person met in person ───────── */
+function normPhoneLocal(raw) {
+  const s = String(raw || '').trim();
+  let d = s.replace(/\D/g, '');
+  if (!d) return '';
+  if (s.startsWith('+')) return d.length >= 8 && d.length <= 15 ? '+' + d : '';
+  if (d.startsWith('00')) return d.length >= 10 ? '+' + d.slice(2) : '';
+  if (d.length === 11 && d.startsWith('0')) d = d.slice(1);
+  if (d.length === 10) return '+91' + d;
+  if (d.length === 12 && d.startsWith('91')) return '+' + d;
+  return '';
+}
+
+function viewAdd(p) {
+  const camps = (S.data && S.data.campaigns) || [];
+  const fields = ((S.data && S.data.fields) || []).filter(f => f.editable && f.key !== 'name' && f.key !== 'phone');
+  const notes = fields.filter(f => f.type === 'note');
+  const others = fields.filter(f => f.type !== 'note');
+  const recentTags = store.get('recentTags', []);
+  const lastTag = store.get('lastTag', '');
+  const lastCamps = store.get('lastAddCamps', null);
+  const pre = p.campaign_id ? [p.campaign_id] : (lastCamps || []);
+  const countToday = store.get('addedToday', { day: '', n: 0 });
+  const today = new Date().toDateString();
+  const n = countToday.day === today ? countToday.n : 0;
+
+  app().innerHTML = `<div class="screen tall">
+      ${topbar('Add a person', n ? `${n} added today on this phone` : 'Someone you met in person', { back: true, noTools: true })}
+      <main>
+        <div class="field">
+          <label for="a_name">Name</label>
+          <input class="input" id="a_name" autocomplete="off" autocapitalize="words" enterkeyhint="next">
+        </div>
+        <div class="field">
+          <label for="a_phone">Phone</label>
+          <input class="input" id="a_phone" type="tel" inputmode="tel" autocomplete="off" placeholder="10-digit mobile" enterkeyhint="next">
+          <span class="hint small" id="a_phone_hint"></span>
+        </div>
+        <div class="field">
+          <label for="a_tag">Where did you meet? <span class="muted small">(stays for the next person)</span></label>
+          <input class="input" id="a_tag" value="${esc(lastTag)}" placeholder="e.g. Infopark stall, 26 Oct" autocomplete="off">
+          ${recentTags.length ? `<div class="quick" id="tagchips">${recentTags.map(t => `<button type="button" data-tag="${esc(t)}" aria-pressed="${t === lastTag}">${esc(t)}</button>`).join('')}</div>` : ''}
+        </div>
+        ${camps.length ? `<div class="field"><span class="lbl">Add to campaign</span>
+          <div class="checks" id="a_camps">${camps.map(c => `<label><input type="checkbox" value="${esc(c.id)}" ${pre.includes(c.id) ? 'checked' : ''}> ${esc(c.name)}</label>`).join('')}</div>
+          <span class="hint small">Volunteers will call them from that campaign's list.</span></div>` : ''}
+        ${notes.map(f => `<div class="field pnote"><label for="f_${esc(f.key)}">${esc(f.label)}</label>${`<textarea class="input" rows="2" id="f_${esc(f.key)}" data-key="${esc(f.key)}" data-orig="" placeholder="Interests, timing, anything useful"></textarea>`}</div>`).join('')}
+        ${others.length ? `<details class="note" style="margin-top:16px" id="moredetails"><summary>More details (optional)</summary>
+          <div class="body" style="white-space:normal">${others.map(f => `<div class="field"><label for="f_${esc(f.key)}">${esc(f.label)}</label>${fieldInput(f, '')}</div>`).join('')}</div></details>` : ''}
+        <p class="err" id="a_err" hidden></p>
+      </main>
+      <div class="bottombar"><div class="inner"><div class="row" style="grid-template-columns:1fr 2fr;grid-auto-flow:row">
+        <button class="btn" id="a_done">Save</button>
+        <button class="btn primary" id="a_next">Save, add another</button>
+      </div></div></div>
+    </div>`;
+  bindTopbar(app());
+
+  const phoneEl = $('#a_phone');
+  const hint = $('#a_phone_hint');
+  const checkPhone = () => {
+    const v = phoneEl.value.trim();
+    if (!v) { hint.textContent = ''; return; }
+    const norm = normPhoneLocal(v);
+    hint.textContent = norm ? 'Saved as ' + fmtPhone(norm) : 'Check the number: 10 digits, or start with + for other countries';
+    hint.classList.toggle('err', !norm);
+  };
+  phoneEl.addEventListener('input', checkPhone);
+  const tagEl = $('#a_tag');
+  app().querySelectorAll('[data-tag]').forEach(b => b.addEventListener('click', () => {
+    tagEl.value = b.dataset.tag;
+    app().querySelectorAll('[data-tag]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
+  }));
+
+  const submit = another => {
+    const err = $('#a_err');
+    const name = $('#a_name').value.trim();
+    const phone = normPhoneLocal(phoneEl.value);
+    const problems = [];
+    if (!name) problems.push('Enter their name.');
+    if (!phone) problems.push('Enter a valid phone number.');
+    if (problems.length) { err.textContent = problems.join(' '); err.hidden = false; (name ? phoneEl : $('#a_name')).focus(); return; }
+    err.hidden = true;
+    const dupe = S.outbox.find(ev => ev.kind === 'add' && ev.values && ev.values.phone === phone);
+    if (dupe) { err.textContent = `You already added ${dupe.values.name} with this number. It's waiting to send.`; err.hidden = false; return; }
+
+    const values = { name, phone };
+    app().querySelectorAll('[data-key]').forEach(el => { const v = readField(el); if (v) values[el.dataset.key] = v; });
+    const tag = tagEl.value.trim();
+    const campIds = [...app().querySelectorAll('#a_camps input:checked')].map(i => i.value);
+    S.outbox.push({ kind: 'add', id: uid(), by: S.user.email, values, tags: tag, campaign_ids: campIds, added_at: Date.now() });
+    save('outbox');
+    store.set('lastTag', tag);
+    if (tag) store.set('recentTags', [tag].concat(recentTags.filter(t => t !== tag)).slice(0, 5));
+    if (!p.campaign_id) store.set('lastAddCamps', campIds);
+    store.set('addedToday', { day: today, n: n + 1 });
+    syncOutbox();
+    toast(`${name} saved${navigator.onLine ? '' : ' on this phone. It will send when you are online'}`);
+    if (another) { nav('add', p, true); setTimeout(() => { const el = $('#a_name'); if (el) el.focus(); }, 50); }
+    else history.back();
+  };
+  $('#a_next').addEventListener('click', () => submit(true));
+  $('#a_done').addEventListener('click', () => submit(false));
+  $('#a_name').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); phoneEl.focus(); } });
+  setTimeout(() => $('#a_name').focus(), 50);
+}
+
+/* ───────── finding people again ───────── */
+function rememberPerson(per) {
+  S.people[per.contact_id] = Object.assign({}, per, { _at: Date.now() });
+  const ids = Object.keys(S.people).sort((a, b) => (S.people[b]._at || 0) - (S.people[a]._at || 0));
+  ids.slice(40).forEach(id => { delete S.people[id]; });
+  save('people');
+}
+
+async function loadPerson(id, quiet) {
+  try {
+    const r = await api('person', { contact_id: id });
+    rememberPerson(r.person);
+    if (S.view && ['person', 'edit'].includes(S.view.view) && S.view.params.contact_id === id && S.view.view === 'person') render();
+    return r.person;
+  } catch (e) {
+    if (!quiet) toast(e.code === 'NET' ? 'Offline: showing what this phone saved last time' : e.message, 3500);
+    if (e.code === 'NOT_FOUND' || e.code === 'NO_ACCESS') { delete S.people[id]; save('people'); }
+    return null;
+  }
+}
+
+function personRow(x, sub) {
+  const camps = (x.campaigns || []).map(m => m.name + (m.status ? ': ' + m.status : '')).join(', ');
+  const flag = x.do_not_call ? '<span class="chip noanswer">Do not call</span>' : x.bad_number ? '<span class="chip noanswer">Wrong number</span>' : '';
+  return `<button class="person" data-person="${esc(x.contact_id)}">
+      <span class="nm">${esc(x.name || fmtPhone(x.phone))}</span>${flag || `<span class="muted small">${esc(fmtPhone(x.phone))}</span>`}
+      <span class="ln">${sub ? sub + '<br>' : ''}${esc([x.area, camps].filter(Boolean).join(' · '))}</span>
+    </button>`;
+}
+
+let findTimer = null;
+function viewFind(p) {
+  const q = p.q || '';
+  app().innerHTML = `<div class="screen">
+      ${topbar('Find a person', 'For call-backs and corrections', { back: true, noTools: true })}
+      <main>
+        <div class="field" style="margin-top:4px">
+          <label for="q" class="sr">Name or number</label>
+          <input class="input" id="q" type="search" value="${esc(q)}" placeholder="Name or last 4 digits" autocomplete="off" enterkeyhint="search">
+        </div>
+        <div id="results"></div>
+        <div class="h2row"><h2>You called or added recently</h2></div>
+        <div id="recent"><p class="muted">Loading…</p></div>
+      </main></div>`;
+  bindTopbar(app());
+  const input = $('#q');
+  const bindRows = root => root.querySelectorAll('[data-person]').forEach(b => b.addEventListener('click', () => {
+    try { history.replaceState({ view: 'find', params: { q: input.value } }, ''); } catch (e) { }
+    nav('person', { contact_id: b.dataset.person });
+  }));
+  const showRecent = list => {
+    const el = $('#recent');
+    if (!el) return;
+    el.innerHTML = list && list.length
+      ? `<div class="people">${list.map(x => personRow(x, x.my_last ? esc(x.my_last.status) + ', ' + esc(ago(x.my_last.at)) : '')).join('')}</div>`
+      : '<div class="empty">Nobody yet. People you call or add in the next 14 days appear here.</div>';
+    bindRows(el);
+  };
+  showRecent(S.recent);
+  api('recent').then(r => { S.recent = r.results; save('recent'); showRecent(S.recent); }).catch(() => { if (!S.recent) $('#recent').innerHTML = '<div class="empty">Connect to the internet to see this list.</div>'; });
+
+  const run = async () => {
+    const v = input.value.trim();
+    const res = $('#results');
+    const digits = v.replace(/\D/g, ''), text = v.replace(/[\d+()\-\s]/g, '');
+    if (digits.length < 4 && text.length < 3) { res.innerHTML = v ? '<p class="muted small">Keep typing: 3 letters of the name or 4 digits of the number.</p>' : ''; return; }
+    res.innerHTML = '<p class="muted small">Searching…</p>';
+    try {
+      const r = await api('search', { q: v });
+      if (input.value.trim() !== v) return;
+      res.innerHTML = r.results.length
+        ? `<h2>Found ${r.results.length}${r.more ? '+' : ''}</h2><div class="people">${r.results.map(x => personRow(x)).join('')}</div>${r.more ? `<p class="muted small">${r.more} more. Type more of the name or number.</p>` : ''}`
+        : `<div class="empty"><strong>Nobody found</strong>${r.scope === 'mine' ? 'You can only find people you called or added.' : 'Check the spelling, or try the last digits of the number.'}<br><button class="linkbtn" id="addinstead">Add them as a new person</button></div>`;
+      bindRows(res);
+      const ai = $('#addinstead');
+      if (ai) ai.addEventListener('click', () => nav('add', {}));
+    } catch (e) {
+      res.innerHTML = `<p class="err">${esc(e.code === 'NET' ? 'Searching needs internet. Recent people below work offline.' : e.message)}</p>`;
+    }
+  };
+  input.addEventListener('input', () => { clearTimeout(findTimer); findTimer = setTimeout(run, 350); });
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') { clearTimeout(findTimer); run(); } });
+  if (q) run(); else setTimeout(() => input.focus(), 50);
+}
+
+function viewPerson(p) {
+  const per = S.people[p.contact_id];
+  if (!per) {
+    app().innerHTML = `<div class="screen">${topbar('Person', '', { back: true, noTools: true })}<main><div class="empty"><strong>Loading…</strong></div></main></div>`;
+    bindTopbar(app());
+    loadPerson(p.contact_id).then(x => { if (x) render(); else if (S.view.view === 'person') history.back(); });
+    return;
+  }
+  const nm = firstName(per.name) || 'them';
+  const x = { contact: per.contact, campaign_id: '' };
+  const facts = cardFacts(x);
+  const blocked = per.do_not_call ? 'Marked "do not call".' : per.bad_number ? 'Marked as a wrong number.' : '';
+  const camps = per.campaigns || [];
+  const canLog = (S.data && S.data.campaigns || []).length > 0;
+  const queued = S.outbox.filter(ev => ev.contact_id === per.contact_id).length;
+
+  app().innerHTML = `<div class="screen tall">
+      ${topbar(per.name || 'Person', queued ? queued + ' change(s) waiting to send' : '', { back: true })}
+      <main class="callmain">
+        <section class="callcard">
+          <div class="cc-row">
+            <div class="cc-who"><div class="cc-name">${esc(per.name || fmtPhone(per.phone))}</div><div class="cc-phone">${esc(fmtPhone(per.phone))}</div></div>
+            <a class="round wa" id="pwa" href="${esc(waHref(per.phone))}" target="_blank" rel="noopener" aria-label="WhatsApp ${esc(nm)}">${ICON.wa}</a>
+          </div>
+          ${per.tags ? `<div class="cc-facts">${per.tags.split(',').map(t => `<span>${esc(t.trim())}</span>`).join('')}</div>` : ''}
+        </section>
+        ${blocked ? `<div class="alert bad">${blocked} If that was a mistake, use "Fix result" on the campaign below.</div>` : ''}
+        ${personNotesHtml(x)}
+        ${facts.length ? `<dl class="facts">${facts.map(f => `<dt>${esc(f.label)}</dt><dd>${esc(f.value)}</dd>`).join('')}</dl>` : ''}
+        <button class="btn" id="editdetails" style="margin-top:14px">${ICON.edit} Edit details or add a note</button>
+
+        <h2>Campaigns</h2>
+        ${camps.length ? `<div class="people">${camps.map(m => `<div class="person static">
+            <span class="nm">${esc(m.name)}</span>${m.status ? `<span class="chip ${({ callback: 'callback', noanswer: 'noanswer', exhausted: 'noanswer', bad_number: 'bad', dnc: 'bad', final: 'done' })[m.state] || 'retry'}">${esc(m.status)}</span>` : '<span class="chip new">Not called</span>'}
+            <span class="ln">${[m.last_called_at ? 'Last call ' + esc(ago(m.last_called_at)) + (m.last_called_by ? ' by ' + esc(m.last_called_by) : '') : '', m.callback_at && m.state === 'callback' ? 'Call back ' + esc(when(m.callback_at)) : '', m.held_by ? '<span class="warn">On ' + esc(m.held_by) + '\'s list right now</span>' : '', m.mine ? '<b>On your list</b>' : ''].filter(Boolean).join('<br>')}</span>
+            ${m.usable && m.status ? `<span class="acts"><button class="linkbtn" data-fix="${esc(m.campaign_id)}">Fix result</button></span>` : ''}
+          </div>`).join('')}</div>` : '<p class="muted">Not in any campaign yet. Logging a call adds them.</p>'}
+
+        <h2>History</h2>
+        ${(per.history || []).length ? timelineHtml(per.history, '') : '<p class="muted">Nothing logged yet.</p>'}
+      </main>
+      <div class="bottombar"><div class="inner"><div class="row">
+        <a class="btn call" id="pcall" href="${esc(telHref(per.phone))}">${ICON.phone} Call</a>
+        ${canLog ? '<button class="btn primary" id="plog">Log a call</button>' : ''}
+      </div></div></div>
+    </div>`;
+  bindTopbar(app());
+  $('#editdetails').addEventListener('click', () => nav('edit', { contact_id: per.contact_id }));
+  app().querySelectorAll('[data-fix]').forEach(b => b.addEventListener('click', () => nav('log', { person: true, contact_id: per.contact_id, campaign_id: b.dataset.fix, correction: true })));
+  const pl = $('#plog');
+  if (pl) pl.addEventListener('click', () => nav('log', { person: true, contact_id: per.contact_id }));
+  $('#pcall').addEventListener('click', () => {
+    S.pending = { person: true, contact_id: per.contact_id, campaign_id: '', t: Date.now(), channel: 'phone' };
+    save('pending');
+    setTimeout(() => { if (S.view && S.view.view === 'person') nav('log', { person: true, contact_id: per.contact_id }); }, 600);
+  });
+  if (!p._loaded) { S.view.params._loaded = true; loadPerson(per.contact_id, true); }
+}
+
+function viewEdit(p) {
+  const per = S.people[p.contact_id];
+  if (!per) { nav('person', { contact_id: p.contact_id }, true); return; }
+  const fields = ((S.data && S.data.fields) || []).filter(f => f.editable && f.key !== 'phone');
+  const noteF = fields.filter(f => f.type === 'note');
+  const others = fields.filter(f => f.type !== 'note');
+  const v = per.contact.values || {};
+  app().innerHTML = `<div class="screen tall">
+      ${topbar('Edit details', per.name, { back: true, noTools: true })}
+      <main>
+        ${noteF.map(f => `<div class="field pnote"><label for="f_${esc(f.key)}">${esc(f.label)}</label><textarea class="input" rows="3" id="f_${esc(f.key)}" data-key="${esc(f.key)}" data-orig="${esc(v[f.key] || '')}">${esc(v[f.key] || '')}</textarea></div>`).join('')}
+        ${others.map(f => `<div class="field"><label for="f_${esc(f.key)}">${esc(f.label)}</label>${fieldInput(f, f.key === 'name' ? (v.name || per.name) : v[f.key])}</div>`).join('')}
+        <div class="field">
+          <label for="enote">Add a note to the history <span class="muted small">(optional)</span></label>
+          <textarea class="input" id="enote" rows="2" placeholder="e.g. met at satsang, confirmed Saturday batch"></textarea>
+        </div>
+        <p class="muted small">The phone number can only be changed by the coordinator in the Sheet. Every change is kept in the Calls log.</p>
+      </main>
+      <div class="bottombar"><div class="inner"><button class="btn primary" id="esave">Save changes</button></div></div>
+    </div>`;
+  bindTopbar(app());
+  const els = [...app().querySelectorAll('[data-key]')];
+  const mark = () => els.forEach(el => el.classList.toggle('changed', readField(el) !== el.dataset.orig));
+  els.forEach(el => { el.addEventListener('input', mark); el.addEventListener('change', mark); });
+  $('#esave').addEventListener('click', () => {
+    const changes = {};
+    els.forEach(el => {
+      const val = readField(el);
+      if (val === el.dataset.orig) return;
+      const f = fields.find(ff => ff.key === el.dataset.key);
+      if (f && f.key === 'name' && !val) return;
+      changes[el.dataset.key] = f && f.type === 'yesno' ? (val === 'yes' ? true : val === 'no' ? false : '') : val;
+    });
+    const note = $('#enote').value.trim();
+    if (!Object.keys(changes).length && !note) { history.back(); return; }
+    S.outbox.push({ kind: 'edit', id: uid(), by: S.user.email, contact_id: per.contact_id, contact_name: per.name, changes, note });
+    save('outbox');
+    Object.keys(changes).forEach(k => { per.contact.values[k] = changes[k]; if (k === 'name') { per.name = changes[k]; per.contact.name = changes[k]; } });
+    (per.history = per.history || []).unshift({ at: Date.now(), by: S.user.name, status: Object.keys(changes).length ? 'Details updated' : 'Note', notes: note, kind: 'edit', pending: true });
+    rememberPerson(per);
+    toast(navigator.onLine ? 'Saved' : 'Saved on this phone. It will send when you are online.');
+    history.back();
+    syncOutbox();
+  });
+}
+
 /* ───────── views: settings ───────── */
 function viewSettings() {
   const q = myOutbox();
@@ -980,10 +1389,10 @@ function viewSettings() {
         <div class="list">
           <div><span class="k">Signed in as</span><span class="v">${esc(S.user ? S.user.name : '')}<br><span class="muted small">${esc(S.user ? S.user.email : '')}</span></span></div>
           <div><span class="k">Centre</span><span class="v">${esc(S.cfg ? S.cfg.n : '')}</span></div>
-          <div><span class="k">Calls waiting to send</span><span class="v">${q.length}${others ? ` <span class="muted small">(+${others} from another account on this phone)</span>` : ''}</span>
+          <div><span class="k">Calls and new people waiting to send</span><span class="v">${q.length}${others ? ` <span class="muted small">(+${others} from another account on this phone)</span>` : ''}</span>
             ${q.length ? '<button class="btn" id="sendnow">Send now</button>' : ''}</div>
           ${S.failed.length ? `<div><span class="k">Calls the server could not save</span>
-            ${S.failed.map(f => `<span class="small">${esc(f.contact_name || f.contact_id)}, ${esc(f.status)}: ${esc(f.reason)}</span>`).join('<br>')}
+            ${S.failed.map(f => `<span class="small">${esc(f.contact_name || (f.values && f.values.name) || f.contact_id)}, ${esc(f.status)}: ${esc(f.reason)}</span>`).join('<br>')}
             <button class="btn" id="clearfailed">Clear this list</button></div>` : ''}
         </div>
         <h2>Another phone</h2>
