@@ -5,7 +5,8 @@
  */
 'use strict';
 
-const VERSION = '1.5.0';
+const VERSION = '1.6.0';
+const NEEDS_SERVER = '1.6.0'; // oldest Apps Script version this app works with
 const RECENT_DEFAULT_H = 24;
 const PENDING_MAX_MS = 3 * 3600e3;
 
@@ -24,8 +25,9 @@ const S = {
   outbox: store.get('outbox', []),      // unsent call logs
   failed: store.get('failed', []),      // logs the server refused
   pending: store.get('pending', null),  // call in progress {campaign_id, contact_id, t, person?}
-  people: store.get('people', {}),      // person pages seen recently (works offline)
-  recent: store.get('recent', null),    // my recent people
+  people: store.get('people', {}),      // person pages seen recently (works offline, kept 24 hours)
+  recent: store.get('recent', null),    // my recent people from the Sheet (kept 24 hours)
+  today: store.get('today', []),        // what I did on this phone (kept 24 hours)
   device: store.get('device', null),
   view: null,
   syncing: false,
@@ -167,12 +169,36 @@ async function api(action, payload = {}) {
     throw Object.assign(new Error('The server sent an unexpected reply. Check the Apps Script deployment is set to "Anyone".'), { code: 'BAD_REPLY' });
   }
   S.online = true;
+  checkServerVersion(j.v);
+  if (!j.ok && j.code === 'BAD_REQUEST' && /^Unknown action/.test(j.message || '')) {
+    throw Object.assign(new Error(serverOldMessage(j.v)), { code: 'SERVER_OLD' });
+  }
   if (!j.ok) {
     const err = Object.assign(new Error(j.message || j.code), { code: j.code });
     if (j.code === 'AUTH') authLost(j.message);
     throw err;
   }
   return j;
+}
+
+function verNum(v) { return String(v || '0').split('.').map(n => parseInt(n, 10) || 0).reduce((a, n) => a * 1000 + n, 0); }
+function serverOldMessage(v) {
+  return `The centre's Google script is out of date (${v ? 'v' + v : 'old version'}; this app needs v${NEEDS_SERVER} or newer). Ask the coordinator to deploy a new version in Apps Script. Your calls and new people are kept on this phone until then.`;
+}
+let serverWarned = false;
+function checkServerVersion(v) {
+  if (!v || serverWarned || verNum(v) >= verNum(NEEDS_SERVER)) return;
+  serverWarned = true;
+  const b = $('#banner');
+  if (!b) return;
+  b.innerHTML = '';
+  const span = document.createElement('span');
+  span.textContent = serverOldMessage(v);
+  const btn = document.createElement('button');
+  btn.textContent = 'OK';
+  btn.onclick = () => { b.hidden = true; };
+  b.appendChild(span); b.appendChild(btn);
+  b.hidden = false;
 }
 
 function authLost(message) {
@@ -209,80 +235,124 @@ async function refresh(quiet) {
 /* ───────── outbox (calls saved on the phone until the server confirms) ───────── */
 function myOutbox() { return S.outbox.filter(ev => S.user && ev.by === S.user.email); }
 
-async function syncOutbox() {
-  if (S.syncing || !S.session || !S.user) return;
-  const evs = myOutbox();
-  if (!evs.length) return;
-  S.syncing = true;
-  paintTopbarState();
-  const strip = ev => { const o = Object.assign({}, ev); delete o.by; delete o.kind; delete o.contact_name; delete o.campaign_name; return o; };
-  try {
-    const done = new Set();
-    let failedCalls = 0, failedAdds = 0;
-    const calls = evs.filter(ev => !ev.kind).slice(0, 25);
-    const adds = evs.filter(ev => ev.kind === 'add').slice(0, 25);
-    const edits = evs.filter(ev => ev.kind === 'edit').slice(0, 25);
-    if (calls.length) {
-      const r = await api('log', { events: calls.map(strip) });
-      [].concat(r.accepted || [], r.dup || []).forEach(id => done.add(id));
-      (r.rejected || []).forEach(x => {
-        const ev = S.outbox.find(e => e.id === x.id);
-        if (ev) S.failed.push(Object.assign({}, ev, { reason: x.reason }));
-        done.add(x.id);
-        failedCalls++;
-      });
-      setState(r.state);
-    }
-    if (adds.length) {
-      const r = await api('addContacts', { events: adds.map(strip) });
-      (r.dup || []).forEach(id => done.add(id));
-      (r.results || []).forEach(x => {
-        done.add(x.id);
-        const ev = S.outbox.find(e => e.id === x.id);
-        if (!x.ok) {
-          if (ev) S.failed.push(Object.assign({}, ev, { status: 'New person', reason: x.reason }));
-          failedAdds++;
-        } else if (x.existed) {
-          toast(`${x.name} was already in the list, so their details were added to the existing entry`, 4000);
-        } else if (x.blocked) {
-          toast(`${x.name} is marked "do not call", so they were not added to a campaign`, 4000);
-        }
-      });
-      setState(r.state);
-    }
-    if (edits.length) {
-      const r = await api('updateContacts', { events: edits.map(strip) });
-      (r.dup || []).forEach(id => done.add(id));
-      (r.results || []).forEach(x => {
-        done.add(x.id);
-        if (!x.ok) {
-          const ev = S.outbox.find(e => e.id === x.id);
-          if (ev) S.failed.push(Object.assign({}, ev, { status: 'Edit', reason: x.reason }));
-          failedCalls++;
-        }
-      });
-      setState(r.state);
-    }
-    const touched = new Set(evs.filter(ev => done.has(ev.id)).map(ev => ev.contact_id).filter(Boolean));
-    S.outbox = S.outbox.filter(ev => !done.has(ev.id));
-    save('outbox', 'failed');
-    // the person page on screen shows the saved version
-    if (S.view && S.view.view === 'person' && touched.has(S.view.params.contact_id)) loadPerson(S.view.params.contact_id, true);
-    if (failedCalls) toast((failedCalls === 1 ? '1 call' : failedCalls + ' calls') + " couldn't be saved. See Settings.", 4000);
-    if (failedAdds) toast((failedAdds === 1 ? '1 new person' : failedAdds + ' new people') + " couldn't be saved. See Settings.", 4000);
-    rerender();
-    if (myOutbox().length) setTimeout(syncOutbox, 500);
-  } catch (e) {
-    // keep everything; we'll retry
-  } finally {
-    S.syncing = false;
+/**
+ * Sends everything queued on this phone in one request. With {claim: campaignId} it also
+ * asks for more contacts in the same request (and throws if that fails, so the caller can say so).
+ */
+let syncPromise = null;
+async function syncOutbox(opts = {}) {
+  if (!S.session || !S.user) return null;
+  if (syncPromise) { try { await syncPromise; } catch (e) { /* ignore */ } if (!opts.claim && !myOutbox().length) return null; }
+  const evs = myOutbox().slice(0, 40);
+  if (!evs.length && !opts.claim) return null;
+  const strip = ev => { const o = Object.assign({}, ev); delete o.by; delete o.contact_name; delete o.campaign_name; return o; };
+  const run = (async () => {
+    S.syncing = true;
     paintTopbarState();
+    try {
+      const r = await api('sync', Object.assign({ events: evs.map(strip) }, opts.claim ? { claim: opts.claim } : {}));
+      const done = new Set([].concat(r.accepted || [], r.dup || []));
+      let failedN = 0;
+      (r.rejected || []).forEach(x => {
+        done.add(x.id);
+        const ev = S.outbox.find(e => e.id === x.id);
+        if (ev) { S.failed.push(Object.assign({}, ev, { status: ev.status || ({ add: 'New person', edit: 'Edit', release: 'Give back' })[ev.kind] || '', reason: x.reason })); failedN++; }
+      });
+      (r.results || []).forEach(x => {
+        const ev = S.outbox.find(e => e.id === x.id);
+        if (!ev || ev.kind !== 'add' || !x.ok) return;
+        noteTodayAdded(ev.id, x.contact_id);
+        if (x.existed) toast(`${x.name} was already in the list, so their details were added to the existing entry`, 4000);
+        else if (x.blocked) toast(`${x.name} is marked "do not call", so they were not added to a campaign`, 4000);
+      });
+      const touched = new Set(evs.filter(ev => done.has(ev.id)).map(ev => ev.contact_id).filter(Boolean));
+      S.outbox = S.outbox.filter(ev => !done.has(ev.id));
+      save('outbox', 'failed');
+      setState(r.state);
+      if (failedN) toast((failedN === 1 ? '1 item' : failedN + ' items') + " couldn't be saved. See Settings.", 4000);
+      if (S.view && S.view.view === 'person' && touched.has(S.view.params.contact_id)) loadPerson(S.view.params.contact_id, true);
+      rerender();
+      return r;
+    } finally {
+      S.syncing = false;
+      paintTopbarState();
+    }
+  })();
+  syncPromise = run;
+  try {
+    const r = await run;
+    syncPromise = null;
+    if (myOutbox().length) setTimeout(() => syncOutbox(), 300);
+    return r;
+  } catch (e) {
+    syncPromise = null;
+    if (opts.claim) throw e;
+    return null; // everything stays queued; we retry later
   }
 }
 setInterval(() => { if (myOutbox().length) syncOutbox(); }, 20000);
 
+/* ───────── what this phone did in the last 24 hours (deleted after that) ───────── */
+const DAY_MS = 24 * 3600e3;
+function rememberToday(entry) {
+  entry.at = entry.at || Date.now();
+  S.today = [entry].concat(S.today.filter(t => !((entry.contact_id && t.contact_id === entry.contact_id) || (entry.phone && t.phone === entry.phone)))).slice(0, 150);
+  save('today');
+}
+function noteTodayAdded(evId, contactId) {
+  const t = S.today.find(x => x.ev === evId);
+  if (t && contactId) { t.contact_id = contactId; save('today'); }
+}
+function pruneLocal() {
+  const cutoff = Date.now() - DAY_MS;
+  S.today = S.today.filter(t => t.at > cutoff);
+  Object.keys(S.people).forEach(id => { if (!(S.people[id]._at > cutoff)) delete S.people[id]; });
+  if (S.recent && !(store.get('recentAt', 0) > cutoff)) { S.recent = null; store.del('recent'); }
+  save('today', 'people');
+  try {
+    Object.keys(localStorage).filter(k => k.startsWith('seva:draft:')).forEach(k => {
+      const d = store.get(k.slice(5), null);
+      if (!d || !(d._t > cutoff)) localStorage.removeItem(k);
+    });
+  } catch (e) { /* ignore */ }
+}
+function clearLocalPeople() {
+  S.today = []; S.people = {}; S.recent = null;
+  store.del('today'); store.del('people'); store.del('recent'); store.del('recentAt');
+  try { Object.keys(localStorage).filter(k => k.startsWith('seva:draft:')).forEach(k => localStorage.removeItem(k)); } catch (e) { /* ignore */ }
+}
+setInterval(pruneLocal, 3600e3);
+
+/** A person page built from what the phone already knows, so it opens instantly and offline. */
+function personFromClaim(x, c, result) {
+  const per = Object.assign({}, S.people[x.contact.contact_id] || {});
+  per.contact_id = x.contact.contact_id;
+  per.name = x.contact.name; per.phone = x.contact.phone;
+  per.contact = JSON.parse(JSON.stringify(x.contact));
+  per.area = (x.contact.values || {}).area || per.area || '';
+  per.history = per.history && per.history.length ? per.history : (x.history || []).slice();
+  const camps = (per.campaigns || []).filter(m => m.campaign_id !== c.id);
+  camps.unshift({ campaign_id: c.id, name: c.name, usable: true, status: result ? result.label : x.status, state: result ? result.outcome : x.state, last_called_at: result ? Date.now() : x.last_called_at, last_called_by: result ? S.user.name : x.last_called_by });
+  (x.others || []).forEach(o => { if (!camps.find(m => m.name === o.campaign)) camps.push({ campaign_id: '', name: o.campaign, usable: false, status: o.status }); });
+  per.campaigns = camps;
+  return per;
+}
+
 /* ───────── derived data ───────── */
 function campaign(id) { return S.data && S.data.campaigns.find(c => c.id === id); }
+/** Give contacts back right away on the phone; the Sheet is updated in the background. */
+function releaseLocal(campaignId, ids) {
+  if (!ids.length || !S.data) return;
+  const before = S.data.claims.length;
+  S.data.claims = S.data.claims.filter(x => !(x.campaign_id === campaignId && ids.includes(x.contact.contact_id)));
+  const n = before - S.data.claims.length;
+  const c = campaign(campaignId);
+  if (c && c.counts && n) { c.counts.mine = Math.max(0, (c.counts.mine || 0) - n); c.counts.due = (c.counts.due || 0) + n; }
+  save('data');
+  S.outbox.push({ kind: 'release', id: uid(), by: S.user.email, campaign_id: campaignId, contact_ids: ids });
+  save('outbox');
+  syncOutbox();
+}
 function isQueued(campaignId, contactId) {
   return S.outbox.some(ev => ev.campaign_id === campaignId && ev.contact_id === contactId);
 }
@@ -342,19 +412,48 @@ function nextClaim(campaignId, exceptId) {
 }
 
 /* ───────── router ───────── */
+/* The app keeps its own copy of the back-stack, so a save can return to the screen it came from
+   instead of piling up stale screens that the Back button would walk through. */
+const trail = [];
+let trailIdx = 0;
+let afterPop = null;
 function nav(view, params = {}, replace = false) {
   S.view = { view, params };
-  const st = { view, params };
+  const i = replace ? trailIdx : trailIdx + 1;
+  const st = { view, params, i };
   try {
     if (replace) history.replaceState(st, '');
     else history.pushState(st, '');
   } catch (e) { /* ignore */ }
+  trailIdx = i;
+  trail.length = i;
+  trail[i] = { view, params };
   render();
   window.scrollTo(0, 0);
 }
+/** Go back to the nearest earlier screen matching view/test; then() runs once it is shown. False if none. */
+function goBackTo(view, test, then) {
+  for (let j = trailIdx - 1; j >= 0; j--) {
+    const t = trail[j];
+    if (t && t.view === view && (!test || test(t.params || {}))) {
+      afterPop = then || null;
+      history.go(j - trailIdx);
+      return true;
+    }
+  }
+  return false;
+}
 window.addEventListener('popstate', e => {
-  if (e.state && e.state.view) { S.view = e.state; render(); }
-  else { S.view = { view: startView(), params: {} }; render(); }
+  if (e.state && e.state.view) {
+    S.view = { view: e.state.view, params: e.state.params || {} };
+    trailIdx = typeof e.state.i === 'number' ? e.state.i : 0;
+    trail[trailIdx] = { view: S.view.view, params: S.view.params };
+  } else {
+    S.view = { view: startView(), params: {} };
+    trailIdx = 0;
+  }
+  render();
+  if (afterPop) { const f = afterPop; afterPop = null; f(); }
 });
 function startView() {
   if (!S.cfg) return 'setup';
@@ -707,23 +806,17 @@ function viewCampaign(p) {
     const btn = e.currentTarget;
     busy(btn, true);
     try {
-      const r = await api('claim', { campaign_id: c.id });
-      setState(r.state);
-      toast(r.given ? `${r.given} added to your list` : 'Nobody new to give right now');
+      const r = await syncOutbox({ claim: c.id });
+      toast(r && r.given ? `${r.given} added to your list` : 'Nobody new to give right now');
     } catch (err) { toast(err.message, 3500); }
     finally { render(); }
   });
   const gb = $('#giveback');
-  if (gb) gb.addEventListener('click', async e => {
-    const btn = e.currentTarget;
+  if (gb) gb.addEventListener('click', () => {
     if (!confirm('Give these contacts back so other volunteers can call them?')) return;
-    busy(btn, true);
-    try {
-      const r = await api('release', { campaign_id: c.id, contact_ids: list.map(x => x.contact.contact_id) });
-      setState(r.state);
-      toast('List given back');
-    } catch (err) { toast(err.message, 3500); }
-    finally { render(); }
+    releaseLocal(c.id, list.map(x => x.contact.contact_id));
+    toast('List given back');
+    render();
   });
 }
 
@@ -775,15 +868,10 @@ function viewContact(p) {
   $('#wa').addEventListener('click', () => mark('whatsapp'));
   $('#logonly').addEventListener('click', () => nav('log', { campaign_id: c.id, contact_id: x.contact.contact_id }));
   $('#openperson').addEventListener('click', () => nav('person', { contact_id: x.contact.contact_id }));
-  $('#giveone').addEventListener('click', async e => {
-    const btn = e.currentTarget;
-    busy(btn, true);
-    try {
-      const r = await api('release', { campaign_id: c.id, contact_ids: [x.contact.contact_id] });
-      setState(r.state);
-      toast('Given back');
-      history.back();
-    } catch (err) { toast(err.message, 3500); busy(btn, false); }
+  $('#giveone').addEventListener('click', () => {
+    releaseLocal(c.id, [x.contact.contact_id]);
+    toast('Given back');
+    if (!goBackTo('campaign', pr => pr.id === c.id)) nav('campaign', { id: c.id }, true);
   });
 }
 
@@ -972,7 +1060,7 @@ function viewLog(p) {
   };
   const fieldEls = [...app().querySelectorAll('[data-key]')];
   const persistDraft = () => {
-    const d = { status: picked ? picked.label : draft.status, notes: $('#notes').value };
+    const d = { status: picked ? picked.label : draft.status, notes: $('#notes').value, _t: Date.now() };
     notesF.forEach(f => { const el = $('#f_' + f.key); if (el) d['f:' + f.key] = el.value; });
     store.set('draft:' + p.campaign_id + ':' + p.contact_id, d);
   };
@@ -1031,6 +1119,13 @@ function viewLog(p) {
     S.pending = null;
     save('outbox', 'pending');
     store.del('draft:' + p.campaign_id + ':' + p.contact_id);
+    rememberToday({ contact_id: x.contact.contact_id, name: x.contact.name, phone: x.contact.phone, status: picked.label + (correction ? ' (corrected)' : ''), campaign: c.name });
+    if (!personMode) {
+      const per = personFromClaim(x, c, picked);
+      Object.keys(changes).forEach(k => { per.contact.values[k] = changes[k]; if (k === 'name') { per.contact.name = changes[k]; per.name = changes[k]; } });
+      per.history = [{ at: Date.now(), by: S.user.name, campaign: c.name, status: picked.label, notes: $('#notes').value.trim(), kind: 'call', pending: true }].concat(per.history || []);
+      rememberPerson(per);
+    }
     const savedMsg = navigator.onLine ? 'Saved' : 'Saved on this phone. It will send when you are online.';
     if (personMode) {
       // show the change on the person page straight away; the server copy replaces it after sending
@@ -1044,38 +1139,35 @@ function viewLog(p) {
       }
       toast(savedMsg);
       // go back to the person page this screen was opened from, rather than stacking another copy
-      const prev = history.state;
-      try { history.back(); } catch (e) { nav('person', { contact_id: p.contact_id }, true); }
-      setTimeout(() => { if (S.view && S.view.view === 'log' && history.state === prev) nav('person', { contact_id: p.contact_id }, true); }, 400);
+      if (!goBackTo('person', pr => pr.contact_id === p.contact_id)) nav('person', { contact_id: p.contact_id }, true);
       syncOutbox();
       return;
     }
-    if (!goNext) { toast(savedMsg); nav('campaign', { id: c.id }, true); syncOutbox(); return; }
+    const backToList = then => { if (!goBackTo('campaign', pr => pr.id === c.id, then)) { nav('campaign', { id: c.id }, true); if (then) then(); } };
+    if (!goNext) { toast(savedMsg); backToList(); syncOutbox(); return; }
 
     if (next) {
       toast(savedMsg + '. Next: ' + (next.contact.name || fmtPhone(next.contact.phone)));
-      nav('contact', { campaign_id: c.id, contact_id: next.contact.contact_id }, true);
+      backToList(() => nav('contact', { campaign_id: c.id, contact_id: next.contact.contact_id }));
       syncOutbox();
       return;
     }
     // list finished: send this call, then ask for more people
     const btn = $('#savenext');
     busy(btn, true);
-    await syncOutbox();
     try {
-      const r = await api('claim', { campaign_id: c.id });
-      setState(r.state);
+      const r = await syncOutbox({ claim: c.id });
       const first = myClaims(c.id)[0];
       if (first) {
         toast(`${savedMsg}. ${r.given} more added to your list`);
-        nav('contact', { campaign_id: c.id, contact_id: first.contact.contact_id }, true);
+        backToList(() => nav('contact', { campaign_id: c.id, contact_id: first.contact.contact_id }));
         return;
       }
       toast(savedMsg + '. Nobody else is due right now.', 3500);
     } catch (err) {
       toast(savedMsg + ". Couldn't get more people: " + err.message, 4000);
     }
-    nav('campaign', { id: c.id }, true);
+    backToList();
   };
   $('#saveonly').addEventListener('click', () => doSave(false));
   const sn = $('#savenext');
@@ -1172,8 +1264,10 @@ function viewAdd(p) {
     app().querySelectorAll('[data-key]').forEach(el => { const v = readField(el); if (v) values[el.dataset.key] = v; });
     const tag = tagEl.value.trim();
     const campIds = [...app().querySelectorAll('#a_camps input:checked')].map(i => i.value);
-    S.outbox.push({ kind: 'add', id: uid(), by: S.user.email, values, tags: tag, campaign_ids: campIds, added_at: Date.now() });
+    const evId = uid();
+    S.outbox.push({ kind: 'add', id: evId, by: S.user.email, values, tags: tag, campaign_ids: campIds, added_at: Date.now() });
     save('outbox');
+    rememberToday({ ev: evId, name, phone, status: 'Added', campaign: tag || '' });
     store.set('lastTag', tag);
     if (tag) store.set('recentTags', [tag].concat(recentTags.filter(t => t !== tag)).slice(0, 5));
     if (!p.campaign_id) store.set('lastAddCamps', campIds);
@@ -1242,13 +1336,19 @@ function viewFind(p) {
   const showRecent = list => {
     const el = $('#recent');
     if (!el) return;
-    el.innerHTML = list && list.length
-      ? `<div class="people">${list.map(x => personRow(x, x.my_last ? esc(x.my_last.status) + ', ' + esc(ago(x.my_last.at)) : '')).join('')}</div>`
-      : '<div class="empty">Nobody yet. People you call or add in the next 14 days appear here.</div>';
+    pruneLocal();
+    const local = S.today.map(t => ({ contact_id: t.contact_id || '', name: t.name, phone: t.phone, campaigns: [], area: t.campaign || '', my_last: { at: t.at, status: t.status }, _local: true }));
+    const seen = new Set(local.map(x => x.contact_id).filter(Boolean));
+    const seenPhone = new Set(local.map(x => x.phone));
+    const merged = local.concat((list || []).filter(x => !seen.has(x.contact_id) && !seenPhone.has(x.phone)));
+    el.innerHTML = merged.length
+      ? `<div class="people">${merged.map(x => x.contact_id ? personRow(x, x.my_last ? esc(x.my_last.status) + ', ' + esc(ago(x.my_last.at)) : '')
+          : `<div class="person static"><span class="nm">${esc(x.name)}</span><span class="muted small">${esc(fmtPhone(x.phone))}</span><span class="ln">${esc(x.my_last.status)}, ${esc(ago(x.my_last.at))}. Waiting to send.</span></div>`).join('')}</div>`
+      : '<div class="empty">Nobody yet. People you call or add appear here.</div>';
     bindRows(el);
   };
   showRecent(S.recent);
-  api('recent').then(r => { S.recent = r.results; save('recent'); showRecent(S.recent); }).catch(() => { if (!S.recent) $('#recent').innerHTML = '<div class="empty">Connect to the internet to see this list.</div>'; });
+  api('recent').then(r => { S.recent = r.results; save('recent'); store.set('recentAt', Date.now()); showRecent(S.recent); }).catch(() => { if (!S.recent && !S.today.length) $('#recent').innerHTML = '<div class="empty">Connect to the internet to see this list.</div>'; });
 
   const run = async () => {
     const v = input.value.trim();
@@ -1370,6 +1470,7 @@ function viewEdit(p) {
     if (!Object.keys(changes).length && !note) { history.back(); return; }
     S.outbox.push({ kind: 'edit', id: uid(), by: S.user.email, contact_id: per.contact_id, contact_name: per.name, changes, note });
     save('outbox');
+    rememberToday({ contact_id: per.contact_id, name: per.name, phone: per.phone, status: Object.keys(changes).length ? 'Details updated' : 'Note added', campaign: '' });
     Object.keys(changes).forEach(k => { per.contact.values[k] = changes[k]; if (k === 'name') { per.name = changes[k]; per.contact.name = changes[k]; } });
     (per.history = per.history || []).unshift({ at: Date.now(), by: S.user.name, status: Object.keys(changes).length ? 'Details updated' : 'Note', notes: note, kind: 'edit', pending: true });
     rememberPerson(per);
@@ -1389,7 +1490,7 @@ function viewSettings() {
         <div class="list">
           <div><span class="k">Signed in as</span><span class="v">${esc(S.user ? S.user.name : '')}<br><span class="muted small">${esc(S.user ? S.user.email : '')}</span></span></div>
           <div><span class="k">Centre</span><span class="v">${esc(S.cfg ? S.cfg.n : '')}</span></div>
-          <div><span class="k">Calls and new people waiting to send</span><span class="v">${q.length}${others ? ` <span class="muted small">(+${others} from another account on this phone)</span>` : ''}</span>
+          <div><span class="k">Waiting to send (calls, new people, edits, give-backs)</span><span class="v">${q.length}${others ? ` <span class="muted small">(+${others} from another account on this phone)</span>` : ''}</span>
             ${q.length ? '<button class="btn" id="sendnow">Send now</button>' : ''}</div>
           ${S.failed.length ? `<div><span class="k">Calls the server could not save</span>
             ${S.failed.map(f => `<span class="small">${esc(f.contact_name || (f.values && f.values.name) || f.contact_id)}, ${esc(f.status)}: ${esc(f.reason)}</span>`).join('<br>')}
@@ -1425,11 +1526,10 @@ function viewSettings() {
     } catch (err) { toast(err.message, 3500); }
     finally { busy(btn, false); }
   });
-  $('#signout').addEventListener('click', async e => {
-    const btn = e.currentTarget;
-    if (q.length && !confirm(`${q.length} call${q.length > 1 ? 's are' : ' is'} not sent yet. They stay on this phone and send after you sign in again. Sign out?`)) return;
-    busy(btn, true);
-    try { await api('signout'); } catch (err) { /* offline is fine */ }
+  $('#signout').addEventListener('click', () => {
+    if (q.length && !confirm(`${q.length} item${q.length > 1 ? 's are' : ' is'} not sent yet. They stay on this phone and send after you sign in again. Sign out?`)) return;
+    api('signout').catch(() => { /* offline is fine */ });
+    clearLocalPeople();
     S.session = null; S.data = null;
     save('session', 'data');
     try { if (window.google && google.accounts) google.accounts.id.disableAutoSelect(); } catch (err) { /* ignore */ }
@@ -1491,8 +1591,10 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
     applySetup(fromHash);
     history.replaceState(null, '', location.pathname + location.search);
   }
+  pruneLocal();
   S.view = { view: startView(), params: {} };
-  history.replaceState(S.view, '');
+  history.replaceState({ view: S.view.view, params: {}, i: 0 }, '');
+  trail[0] = { view: S.view.view, params: {} };
   render();
   if (S.session) {
     syncOutbox().then(() => refresh(true)).then(checkReturnFromCall);
